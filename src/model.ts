@@ -2,6 +2,15 @@ export type ConnectionState = 'connected' | 'degraded' | 'offline';
 export type SegmentState = 'pending' | 'confirmed' | 'duplicate' | 'stale' | 'ignored';
 export type SegmentSource = 'live' | 'offline' | 'manual';
 
+export interface CaptionEdition {
+  revision: number;
+  corrected: string;
+  manualBase: string;
+  appliedRules: string[];
+  revisedAt: number;
+  reason: string;
+}
+
 export interface CaptionSegment {
   id: string;
   sequence: number;
@@ -18,6 +27,16 @@ export interface CaptionSegment {
   staleReason?: string;
   revision: number;
   tags: string[];
+  /** 确认时、规则自动替换之前的手动校对底本；规则修订后据此重算，手动修改得以保留。 */
+  manualBase?: string;
+  /** 确认时自动应用过的术语规则 id。 */
+  appliedRules?: string[];
+  /** 历史修订版（旧版），最新在末尾。 */
+  editions?: CaptionEdition[];
+  /** 当前版替换的是哪一版（revision 号）。 */
+  replacesRevision?: number;
+  /** 触发当前修订版的规则 id；离线合并触发时为 'merge'。 */
+  revisedFromRule?: string;
 }
 
 export interface TermRule {
@@ -29,6 +48,7 @@ export interface TermRule {
   caseSensitive: boolean;
   usageCount: number;
   createdAt: number;
+  revision: number;
 }
 
 export interface DeskModel {
@@ -79,6 +99,9 @@ function segment(
     state,
     revision: 0,
     tags: [],
+    manualBase: undefined,
+    appliedRules: [],
+    editions: [],
   };
 }
 
@@ -99,21 +122,28 @@ const duplicate: CaptionSegment = {
   staleReason: '与第 2 段高度相似',
 };
 
+// 已确认、且被术语规则自动替换过的片段：修订术语规则时会按 manualBase 重算。
+const revisedSeed: CaptionSegment = {
+  ...segment('seg-9', 9, 70, '主讲人', '接下来由主讲人演示 studio cloud 的协作流程。', '接下来由主讲人演示 Studio Cloud 的协作流程。', 'confirmed'),
+  manualBase: '接下来由主讲人演示 studio cloud 的协作流程。',
+  appliedRules: ['term-2'],
+};
+
 export function createInitialModel(): DeskModel {
   return {
     eventName: '新品发布会现场字幕',
     eventDate: new Date(now).toISOString().slice(0, 10),
-    segments: [...seededSegments, duplicate],
+    segments: [...seededSegments, duplicate, revisedSeed],
     rules: [
-      { id: 'term-1', source: 'co pilot', replacement: 'Co-Pilot', speaker: '', enabled: true, caseSensitive: false, usageCount: 4, createdAt: now - 86_400_000 },
-      { id: 'term-2', source: 'studio cloud', replacement: 'Studio Cloud', speaker: '', enabled: true, caseSensitive: false, usageCount: 7, createdAt: now - 43_200_000 },
-      { id: 'term-3', source: '五G', replacement: '5G', speaker: '', enabled: true, caseSensitive: true, usageCount: 2, createdAt: now - 3_600_000 },
+      { id: 'term-1', source: 'co pilot', replacement: 'Co-Pilot', speaker: '', enabled: true, caseSensitive: false, usageCount: 4, createdAt: now - 86_400_000, revision: 0 },
+      { id: 'term-2', source: 'studio cloud', replacement: 'Studio Cloud', speaker: '', enabled: true, caseSensitive: false, usageCount: 7, createdAt: now - 43_200_000, revision: 0 },
+      { id: 'term-3', source: '五G', replacement: '5G', speaker: '', enabled: true, caseSensitive: true, usageCount: 2, createdAt: now - 3_600_000, revision: 0 },
     ],
     selectedId: 'seg-4',
     connection: 'connected',
     simulatedDelay: 1.8,
     fontSize: 18,
-    nextSequence: 9,
+    nextSequence: 10,
     autoStream: true,
     updatedAt: now,
   };
@@ -165,10 +195,10 @@ export function normalizePunctuation(text: string): string {
     .replace(/([,;:!?])(?=[^\s,;:!?])/g, (match) => ({ ',': '，', ';': '；', ':': '：', '!': '！', '?': '？' }[match] ?? match));
 }
 
-export function applyRules(text: string, model: DeskModel): { text: string; used: string[] } {
+export function applyRules(text: string, model: DeskModel, speaker = ''): { text: string; used: string[] } {
   let next = text;
   const used: string[] = [];
-  for (const rule of model.rules.filter((item) => item.enabled)) {
+  for (const rule of model.rules.filter((item) => item.enabled && (!item.speaker || item.speaker === speaker))) {
     if (!rule.source || !next) continue;
     const flags = rule.caseSensitive ? 'g' : 'gi';
     const expression = new RegExp(rule.source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
@@ -178,6 +208,75 @@ export function applyRules(text: string, model: DeskModel): { text: string; used
     }
   }
   return { text: normalizePunctuation(next), used };
+}
+
+/** 规则修订后，按确认时的手动底本重算字幕文本；手动修改因底本保留而不会丢失。 */
+export function recalculateSegment(segment: CaptionSegment, model: DeskModel): { text: string; used: string[] } {
+  const base = segment.manualBase ?? segment.original;
+  return applyRules(base, model, segment.speaker);
+}
+
+/** 判断某已确认片段是否受某条规则（按旧译法）影响，需要参与重算。 */
+export function isSegmentAffectedByRule(segment: CaptionSegment, rule: TermRule, oldReplacement: string): boolean {
+  if (segment.state !== 'confirmed') return false;
+  const applied = segment.appliedRules ?? [];
+  if (applied.includes(rule.id)) return true;
+  const base = segment.manualBase ?? segment.original;
+  if (rule.source && base.includes(rule.source)) return true;
+  if (oldReplacement && segment.corrected.includes(oldReplacement)) return true;
+  return false;
+}
+
+function createEdition(segment: CaptionSegment, text: string, reason: string, ruleId: string | undefined, now: number): CaptionSegment {
+  const edition: CaptionEdition = {
+    revision: segment.revision,
+    corrected: segment.corrected,
+    manualBase: segment.manualBase ?? segment.original,
+    appliedRules: segment.appliedRules ?? [],
+    revisedAt: now,
+    reason,
+  };
+  return {
+    ...segment,
+    corrected: text,
+    revision: segment.revision + 1,
+    replacesRevision: segment.revision,
+    revisedFromRule: ruleId,
+    editions: [...(segment.editions ?? []), edition],
+    tags: [...new Set([...segment.tags, '已修订'])],
+  };
+}
+
+/** 修订一条术语规则的译法，并重算所有受影响的已确认片段（另出修订版，不覆盖直播历史）。 */
+export function reviseTermRule(
+  model: DeskModel,
+  ruleId: string,
+  newReplacement: string,
+): { model: DeskModel; affected: number; revised: number } {
+  const rule = model.rules.find((item) => item.id === ruleId);
+  if (!rule) return { model, affected: 0, revised: 0 };
+  const oldReplacement = rule.replacement;
+  const now = Date.now();
+  const updatedRule: TermRule = { ...rule, replacement: newReplacement, revision: rule.revision + 1 };
+  const rules = model.rules.map((item) => (item.id === ruleId ? updatedRule : item));
+  let affected = 0;
+  let revised = 0;
+  const segments = model.segments.map((segment) => {
+    if (!isSegmentAffectedByRule(segment, updatedRule, oldReplacement)) return segment;
+    affected += 1;
+    const { text } = recalculateSegment(segment, { ...model, rules });
+    if (text === segment.corrected) return segment;
+    revised += 1;
+    return createEdition(segment, text, `术语规则「${rule.source}」译法修订`, ruleId, now);
+  });
+  return { model: { ...model, rules, segments, updatedAt: now }, affected, revised };
+}
+
+/** 预览修订某条规则将会影响多少已确认片段（供界面提示）。 */
+export function previewAffectedByRule(model: DeskModel, ruleId: string): number {
+  const rule = model.rules.find((item) => item.id === ruleId);
+  if (!rule) return 0;
+  return model.segments.filter((segment) => isSegmentAffectedByRule(segment, rule, rule.replacement)).length;
 }
 
 export function isDuplicate(candidate: CaptionSegment, existing: CaptionSegment[]): CaptionSegment | undefined {
@@ -197,7 +296,8 @@ export function mergeConfirmedSegments(model: DeskModel): DeskModel {
     .map((item) => ({ ...item }))
     .sort((a, b) => a.sequence - b.sequence || a.startTime - b.startTime)
     .map((item): CaptionSegment => {
-      if (item.source === 'offline' && item.state === 'confirmed') {
+      const wasOfflineConfirmed = item.source === 'offline' && item.state === 'confirmed';
+      if (wasOfflineConfirmed) {
         item.source = item.confirmedAt && Date.now() - item.confirmedAt > 90_000 ? 'offline' : 'live';
         item.staleReason = Date.now() - item.receivedAt > 90_000 ? `离线恢复后合并，原始片段已延迟 ${Math.round((Date.now() - item.receivedAt) / 1000)} 秒` : undefined;
         if (item.staleReason) item.state = 'stale';
@@ -208,6 +308,11 @@ export function mergeConfirmedSegments(model: DeskModel): DeskModel {
         item.duplicateOf = duplicate.id;
       }
       if (item.state !== 'ignored') seen.push(item.id);
+      // 离线确认的片段恢复连接时按当前术语规则重算一遍，规则修订随之生效。
+      if (wasOfflineConfirmed && item.state !== 'duplicate') {
+        const { text } = recalculateSegment(item, model);
+        if (text !== item.corrected) return createEdition(item, text, '离线恢复合并时按当前规则重算', 'merge', Date.now());
+      }
       return item;
     });
 
@@ -260,6 +365,9 @@ export function createLiveSegment(sequence: number): CaptionSegment {
     state: 'pending',
     revision: 0,
     tags: [],
+    manualBase: undefined,
+    appliedRules: [],
+    editions: [],
   };
 }
 
