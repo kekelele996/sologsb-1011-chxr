@@ -4,9 +4,14 @@ import {
   applyRules,
   cloneModel,
   createInitialModel,
+  latestAmendment,
+  liveText,
   mergeConfirmedSegments,
+  migrateModel,
   normalizeNumbers,
   queueStats,
+  recomputeAtMerge,
+  reviseRuleReplacement,
   STORAGE_KEY,
   simulateLatency,
   toSrt,
@@ -14,6 +19,7 @@ import {
   type ConnectionState,
   type DeskModel,
   type SegmentState,
+  type TermApplication,
   type ToastMessage,
 } from './model';
 
@@ -208,14 +214,25 @@ export class CaptionDesk extends LitElement {
     .rule-item strong { display: block; font-size: 11px; }
     .rule-item p { margin: 3px 0 0; color: var(--cds-text-secondary, #525252); font-size: 10px; }
     .rule-item-actions { display: flex; gap: 3px; }
+    .rule-version { color: #0f62fe; font-weight: 500; }
+    .rule-revise { grid-column: 1 / -1; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--cds-border-subtle, #e0e0e0); display: flex; flex-direction: column; gap: 8px; }
+    .rule-revise-actions { display: flex; gap: 6px; }
+    .rule-revise-hint { margin: 0; color: var(--cds-text-secondary, #525252); font-size: 10px; line-height: 1.5; }
     .rule-form { padding: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .rule-form cds-text-input, .rule-form cds-button { width: 100%; }
     .rule-form .full { grid-column: 1 / -1; }
     .live-timeline { padding: 6px 0; }
-    .live-item { padding: 8px 11px; border-left: 3px solid #42be65; margin: 0 10px 7px; background: var(--cds-layer-02, #f4f4f4); }
+    .live-item { padding: 8px 11px; border-left: 3px solid #42be65; margin: 0 10px 7px; background: var(--cds-layer-02, #f4f4f4); cursor: pointer; }
+    .live-item:focus { outline: 1px solid #0f62fe; outline-offset: 1px; }
+    .live-item.selected { outline: 1px solid #78a9ff; }
+    .live-item.amended { border-left-color: #0f62fe; background: #edf5ff; }
     .live-item time { color: #198038; font: 500 9px/1 "IBM Plex Mono", monospace; }
     .live-item p { margin: 5px 0 0; font-size: var(--caption-font-size); line-height: 1.45; }
     .live-item small { display: block; margin-top: 4px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
+    .live-item .amend-badge { color: #0043ce; font-weight: 500; }
+    .live-item .amend-original { text-decoration: line-through; color: #8d8d8d; }
+    .amend-chain { margin: 4px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; }
+    .amend-chain-text { color: var(--cds-text-secondary); margin-top: 2px; }
     .delivery-status { margin: 0 10px 10px; padding: 9px 10px; background: #edf5ff; border-left: 3px solid #0f62fe; color: #0043ce; font-size: 10px; line-height: 1.45; }
 
     .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 20; width: 380px; display: flex; flex-direction: column; gap: 8px; }
@@ -246,6 +263,8 @@ export class CaptionDesk extends LitElement {
   @state() private ruleSpeaker = '';
   @state() private filter: 'active' | 'all' | 'attention' = 'active';
   @state() private showRuleForm = false;
+  @state() private revisingRuleId: string | null = null;
+  @state() private reviseReplacement = '';
   private past: DeskModel[] = [];
   private future: DeskModel[] = [];
   private ticker?: number;
@@ -272,7 +291,7 @@ export class CaptionDesk extends LitElement {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
-        const parsed = JSON.parse(raw) as DeskModel;
+        const parsed = migrateModel(JSON.parse(raw) as DeskModel);
         if (parsed.segments?.length) return parsed;
       }
     } catch {
@@ -347,7 +366,17 @@ export class CaptionDesk extends LitElement {
     if (!selected) return;
     this.commit(label, (current) => ({
       ...current,
-      segments: current.segments.map((item) => item.id === selected.id ? { ...item, ...patch, revision: item.revision + 1 } : item),
+      segments: current.segments.map((item) => {
+        if (item.id !== selected.id) return item;
+        const editingConfirmedText = item.state === 'confirmed' && 'corrected' in patch;
+        return {
+          ...item,
+          ...patch,
+          // 已进入直播区后又被校对员手动改过：术语重算时走定点替换，保留人工修改。
+          manualOverride: editingConfirmedText ? true : item.manualOverride,
+          revision: item.revision + 1,
+        };
+      }),
     }));
   }
 
@@ -373,11 +402,30 @@ export class CaptionDesk extends LitElement {
       this.pushToast('warning', '当前字幕没有该术语', `${rule.source} → ${rule.replacement}`);
       return;
     }
-    this.commit('应用术语替换', (current) => ({
-      ...current,
-      rules: current.rules.map((item) => item.id === rule.id ? { ...item, usageCount: item.usageCount + 1 } : item),
-      segments: current.segments.map((item) => item.id === selected.id ? { ...item, corrected: item.corrected.replace(expression, rule.replacement), revision: item.revision + 1 } : item),
-    }));
+    this.commit('应用术语替换', (current) => {
+      const application: TermApplication = {
+        ruleId: rule.id,
+        ruleVersion: rule.version,
+        source: rule.source,
+        replacement: rule.replacement,
+        kind: 'shortcut',
+        at: Date.now(),
+      };
+      return {
+        ...current,
+        rules: current.rules.map((item) => item.id === rule.id ? { ...item, usageCount: item.usageCount + 1 } : item),
+        segments: current.segments.map((item) => item.id === selected.id ? {
+          ...item,
+          corrected: item.corrected.replace(expression, rule.replacement),
+          ruleApplications: [
+            ...item.ruleApplications.filter((record) => record.ruleId !== rule.id),
+            application,
+          ],
+          tags: item.state === 'confirmed' ? [...new Set([...item.tags, '术语已应用'])] : item.tags,
+          revision: item.revision + 1,
+        } : item),
+      };
+    });
   }
 
   private applyInlineEdit(transform: (value: string) => string, label: string, cursorShift = 0): void {
@@ -441,16 +489,34 @@ export class CaptionDesk extends LitElement {
     const nextOrder = this.pendingSegments.filter((item) => item.id !== selected.id);
     this.commit('确认并送入直播区', (current) => ({
       ...current,
-      segments: current.segments.map((item) => item.id === selected.id ? {
-        ...item,
-        corrected: text,
-        state: 'confirmed',
-        source: offline ? 'offline' : item.source,
-        confirmedAt: Date.now(),
-        staleReason: item.state === 'stale' ? item.staleReason : undefined,
-        tags: used.length ? [...new Set([...item.tags, '术语已应用'])] : item.tags,
-        revision: item.revision + 1,
-      } : item),
+      segments: current.segments.map((item) => {
+        if (item.id !== selected.id) return item;
+        const at = Date.now();
+        // 手动快捷应用的记录保留来源，确认时自动生效的规则补充为 auto 记录。
+        const autoApplications: TermApplication[] = used
+          .filter((ruleId) => !item.ruleApplications.some((record) => record.ruleId === ruleId))
+          .map((ruleId) => {
+            const rule = current.rules.find((candidate) => candidate.id === ruleId)!;
+            return { ruleId, ruleVersion: rule.version, source: rule.source, replacement: rule.replacement, kind: 'auto' as const, at };
+          });
+        // 自动规则没有改动文本（人工已重写），或确认文本与规则自动结果不一致，都视为人工改动需保留。
+        // 判定需按发言人过滤，和编辑台可见/可应用的规则保持一致。
+        const effectiveRules = current.rules.filter((rule) => rule.enabled && (!rule.speaker || rule.speaker === item.speaker));
+        const autoFromOriginal = applyRules(item.original, { ...current, rules: effectiveRules }).text;
+        const manualOverride = used.length ? text !== autoFromOriginal : item.manualOverride || item.corrected !== item.original;
+        return {
+          ...item,
+          corrected: text,
+          state: 'confirmed',
+          source: offline ? 'offline' : item.source,
+          confirmedAt: at,
+          staleReason: item.state === 'stale' ? item.staleReason : undefined,
+          tags: used.length ? [...new Set([...item.tags, '术语已应用'])] : item.tags,
+          ruleApplications: [...item.ruleApplications, ...autoApplications],
+          manualOverride,
+          revision: item.revision + 1,
+        };
+      }),
       rules: current.rules.map((rule) => used.includes(rule.id) ? { ...rule, usageCount: rule.usageCount + 1 } : rule),
       selectedId: nextOrder[0]?.id ?? selected.id,
     }));
@@ -486,13 +552,64 @@ export class CaptionDesk extends LitElement {
   }
 
   private mergeOffline(): void {
-    const merged = mergeConfirmedSegments(this.model);
-    this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
+    const before = this.model;
+    // mergeConfirmedSegments 内部会先按最新术语规则重算离线确认片段，这里提前取数量用于提示。
+    const recomputedIds = recomputeAtMerge(before).amendedIds.length;
+    const merged = mergeConfirmedSegments(before);
+    this.past = [...this.past, cloneModel(before)].slice(-HISTORY_LIMIT);
     this.future = [];
     this.model = merged;
     this.persist();
     const outboxCount = this.model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed').length;
-    this.pushToast('success', '离线队列已合并', `${outboxCount} 个片段仍标记为离线来源，过期修改会继续显示提示`);
+    if (recomputedIds) {
+      this.pushToast('success', '离线队列已合并并重算术语', `${recomputedIds} 个离线片段按最新规则出了修订版，导出将使用修订文本`);
+    } else {
+      this.pushToast('success', '离线队列已合并', `${outboxCount} 个片段仍标记为离线来源，过期修改会继续显示提示`);
+    }
+  }
+
+  private startReviseRule(id: string): void {
+    const rule = this.model.rules.find((item) => item.id === id);
+    if (!rule) return;
+    this.revisingRuleId = id;
+    this.reviseReplacement = rule.replacement;
+  }
+
+  private cancelReviseRule(): void {
+    this.revisingRuleId = null;
+    this.reviseReplacement = '';
+  }
+
+  private saveRevisedRule(): void {
+    const ruleId = this.revisingRuleId;
+    const rule = ruleId ? this.model.rules.find((item) => item.id === ruleId) : undefined;
+    if (!ruleId || !rule) return;
+    const replacement = this.reviseReplacement.trim();
+    if (!replacement) {
+      this.pushToast('warning', '修订译法不能为空', '请输入新的替换文本');
+      return;
+    }
+    if (replacement === rule.replacement) {
+      this.cancelReviseRule();
+      return;
+    }
+    const previous = cloneModel(this.model);
+    const result = reviseRuleReplacement(this.model, ruleId, replacement);
+    if (!result) {
+      this.cancelReviseRule();
+      return;
+    }
+    result.model.updatedAt = Date.now();
+    this.past = [...this.past, previous].slice(-HISTORY_LIMIT);
+    this.future = [];
+    this.model = result.model;
+    this.persist();
+    this.cancelReviseRule();
+    const detail: string[] = [];
+    if (result.amendedIds.length) detail.push(`直播区 ${result.amendedIds.length} 段已另出修订版（直播原版保留）`);
+    if (result.refreshedPendingIds.length) detail.push(`待确认区 ${result.refreshedPendingIds.length} 段已刷新`);
+    if (!detail.length) detail.push('规则版本已更新，当前没有使用旧译法的片段');
+    this.pushToast('success', `规则「${rule.source}」已修订至 v${rule.version + 1}`, detail.join('；'));
   }
 
   private addRuleFromSelection(): void {
@@ -521,6 +638,7 @@ export class CaptionDesk extends LitElement {
         enabled: true,
         caseSensitive: false,
         usageCount: 0,
+        version: 1,
         createdAt: Date.now(),
       }, ...current.rules],
     }));
@@ -651,6 +769,12 @@ export class CaptionDesk extends LitElement {
             ${item.state === 'stale' ? html`
               <cds-inline-notification kind="warning" low-contrast title="过期修改" subtitle=${`${item.staleReason || '该片段已超过 90 秒未确认'}。请结合上下文确认，或忽略以避免污染直播区。`}></cds-inline-notification>
             ` : nothing}
+            ${item.state === 'confirmed' ? html`
+              <cds-inline-notification kind="info" low-contrast title="该片段已在直播区" subtitle="直播历史不直接改写；术语规则修订时会另出修订版。下方文本为直播原版，手动修改会被保留，导出使用最新修订版。"></cds-inline-notification>
+              ${latestAmendment(item) ? html`
+                <cds-inline-notification kind="success" low-contrast title="修订生效文本（导出 SRT 使用此版本）" subtitle=${liveText(item)}></cds-inline-notification>
+              ` : nothing}
+            ` : nothing}
             <div class="form-grid">
               <cds-select label-text="发言人" value=${item.speaker} @cds-select-selected=${(event: CustomEvent<{ value: string }>) => this.updateSelected({ speaker: event.detail.value }, '修改发言人')}>
                 ${['主持人', '主讲人', '嘉宾 / 周然', '现场提问', '未知发言人'].map((speaker) => html`<cds-select-item value=${speaker}>${speaker}</cds-select-item>`)}
@@ -682,10 +806,18 @@ export class CaptionDesk extends LitElement {
             </div>
           </div>
           <div class="confirm-bar">
-            <div class="confirm-hint"><kbd>⌘/Ctrl Enter</kbd> 确认并进入直播区 · <kbd>Alt J/K</kbd> 切换片段</div>
+            <div class="confirm-hint">
+              ${item.state === 'confirmed'
+                ? (latestAmendment(item) ? '该片段已有修订版生效；手动编辑直播原版会被保留并在下次修订时合并' : '已在直播区 · 手动修改会标记为人工改动并保留')
+                : html`<kbd>⌘/Ctrl Enter</kbd> 确认并进入直播区 · <kbd>Alt J/K</kbd> 切换片段`}
+            </div>
             <div>
-              <cds-button kind="danger--tertiary" size="sm" @click=${this.ignoreSelected}>忽略片段</cds-button>
-              <cds-button kind="primary" @click=${this.confirmSelected}>确认并送入直播区</cds-button>
+              ${item.state === 'confirmed'
+                ? html`<cds-tag type="green" size="sm">已确认${latestAmendment(item) ? ` · 修订第 ${latestAmendment(item)!.ordinal} 版` : ''}</cds-tag>`
+                : html`
+                  <cds-button kind="danger--tertiary" size="sm" @click=${this.ignoreSelected}>忽略片段</cds-button>
+                  <cds-button kind="primary" @click=${this.confirmSelected}>确认并送入直播区</cds-button>
+                `}
             </div>
           </div>
         </div>
@@ -708,12 +840,28 @@ export class CaptionDesk extends LitElement {
               <div class="rule-item">
                 <div>
                   <strong>${rule.source} → ${rule.replacement}</strong>
-                  <p>${rule.speaker || '全部发言人'} · 已使用 ${rule.usageCount} 次</p>
+                  <p>${rule.speaker || '全部发言人'} · 已使用 ${rule.usageCount} 次 · <b class="rule-version">v${rule.version}</b>${rule.version > 1 ? '（已修订）' : ''}</p>
                 </div>
                 <div class="rule-item-actions">
                   <cds-button kind="ghost" size="sm" @click=${() => this.applyTerm(rule.id)}>应用</cds-button>
+                  <cds-button kind="tertiary" size="sm" @click=${() => this.startReviseRule(rule.id)}>修订译法</cds-button>
                   <cds-button kind="danger--ghost" size="xs" @click=${() => this.deleteRule(rule.id)}>删除</cds-button>
                 </div>
+                ${this.revisingRuleId === rule.id ? html`
+                  <div class="rule-revise">
+                    <cds-text-input
+                      label-text=${`新译法（当前 v${rule.version}：${rule.replacement}）`}
+                      .value=${this.reviseReplacement}
+                      @input=${(event: Event) => { this.reviseReplacement = (event.currentTarget as any).value; }}
+                      @keydown=${(event: KeyboardEvent) => { if (event.key === 'Enter') this.saveRevisedRule(); }}
+                    ></cds-text-input>
+                    <div class="rule-revise-actions">
+                      <cds-button kind="primary" size="sm" @click=${this.saveRevisedRule}>出版修订并重算</cds-button>
+                      <cds-button kind="ghost" size="sm" @click=${this.cancelReviseRule}>取消</cds-button>
+                    </div>
+                    <p class="rule-revise-hint">已确认片段会另出修订版并标明替换哪一版，直播原版保留；手动改过的片段仅定点替换旧译法。</p>
+                  </div>
+                ` : nothing}
               </div>
             `)}
           </div>
@@ -735,13 +883,21 @@ export class CaptionDesk extends LitElement {
             <span>${confirmed.length} 段已确认</span>
           </div>
           <div class="live-timeline">
-            ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => html`
-              <article class="live-item">
+            ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => {
+              const amendment = latestAmendment(segment);
+              return html`
+              <article class="live-item ${amendment ? 'amended' : ''} ${this.model.selectedId === segment.id ? 'selected' : ''}" role="button" tabindex="0" @click=${() => this.selectSegment(segment.id)}>
                 <time>${formatClock(segment.startTime)} · ${segment.speaker}</time>
-                <p>${segment.corrected}</p>
-                ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : nothing}
+                <p>${liveText(segment)}</p>
+                ${amendment ? html`
+                  <small class="amend-badge">修订第 ${amendment.ordinal} 版 · 替换${amendment.supersedesLabel} · ${amendment.oldReplacement} → ${amendment.newReplacement}${amendment.atMerge ? ' · 离线合并重算' : ''}</small>
+                  <small class="amend-original">直播原版：${segment.corrected}</small>
+                ` : html`
+                  ${segment.manualOverride ? html`<small>含人工修改 · 后续术语修订将保留手动改动</small>` : nothing}
+                  ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : nothing}
+                `}
               </article>
-            `) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
+            `;}) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
           </div>
           ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按时间顺序提交，不会覆盖已确认内容。</div>` : nothing}
         </section>
@@ -754,8 +910,25 @@ export class CaptionDesk extends LitElement {
           <div style="padding: 12px; line-height: 1.5; font-size: 11px;">
             ${item ? html`
               <div><strong>原始字幕：</strong>${item.original}</div>
-              <div style="margin-top: 8px;"><strong>修改前校正：</strong>${item.corrected}</div>
-              <div style="margin-top: 8px; color: var(--cds-text-secondary);">${item.tags.length ? `标签：${item.tags.join('、')}` : '尚未应用术语标签'}</div>
+              <div style="margin-top: 8px;"><strong>直播原版（确认时）：</strong>${item.corrected}</div>
+              ${latestAmendment(item) ? html`
+                <div style="margin-top: 8px; color: #0f62fe;"><strong>当前修订生效文本：</strong>${liveText(item)}</div>
+                <div style="margin-top: 8px;"><strong>修订链：</strong></div>
+                <ol class="amend-chain">
+                  ${item.amendments.map((amendment) => html`
+                    <li>
+                      第 ${amendment.ordinal} 版 · 替换${amendment.supersedesLabel}
+                      （${amendment.oldReplacement} → ${amendment.newReplacement}）
+                      ${amendment.atMerge ? ' · 离线合并时重算' : ''}
+                      <div class="amend-chain-text">${amendment.reason}：${amendment.correctedText}</div>
+                    </li>
+                  `)}
+                </ol>
+              ` : html`<div style="margin-top: 8px;"><strong>当前生效：</strong>${item.corrected}</div>`}
+              <div style="margin-top: 8px; color: var(--cds-text-secondary);">
+                ${item.ruleApplications.length ? `规则来源：${item.ruleApplications.map((record) => `${record.source}（${record.kind === 'auto' ? '确认时自动' : '手动快捷'} · v${record.ruleVersion}）`).join('、')}` : '尚未应用术语'}
+                ${item.manualOverride ? ' · 人工修改已锁定保留' : ''}
+              </div>
             ` : html`<span>请选择片段以查看上下文。</span>`}
           </div>
         </section>

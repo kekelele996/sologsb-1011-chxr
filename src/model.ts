@@ -2,6 +2,30 @@ export type ConnectionState = 'connected' | 'degraded' | 'offline';
 export type SegmentState = 'pending' | 'confirmed' | 'duplicate' | 'stale' | 'ignored';
 export type SegmentSource = 'live' | 'offline' | 'manual';
 
+export interface TermApplication {
+  ruleId: string;
+  ruleVersion: number;
+  source: string;
+  replacement: string;
+  kind: 'auto' | 'shortcut';
+  at: number;
+}
+
+export interface CaptionAmendment {
+  id: string;
+  ordinal: number;
+  ruleId: string;
+  reason: string;
+  supersedesAmendmentId?: string;
+  supersedesLabel: string;
+  previousText: string;
+  correctedText: string;
+  oldReplacement: string;
+  newReplacement: string;
+  atMerge: boolean;
+  createdAt: number;
+}
+
 export interface CaptionSegment {
   id: string;
   sequence: number;
@@ -18,6 +42,9 @@ export interface CaptionSegment {
   staleReason?: string;
   revision: number;
   tags: string[];
+  ruleApplications: TermApplication[];
+  amendments: CaptionAmendment[];
+  manualOverride: boolean;
 }
 
 export interface TermRule {
@@ -28,6 +55,7 @@ export interface TermRule {
   enabled: boolean;
   caseSensitive: boolean;
   usageCount: number;
+  version: number;
   createdAt: number;
 }
 
@@ -79,17 +107,50 @@ function segment(
     state,
     revision: 0,
     tags: [],
+    ruleApplications: [],
+    amendments: [],
+    manualOverride: false,
   };
 }
 
+function applied(ruleId: 'term-1' | 'term-2' | 'term-3', kind: TermApplication['kind'] = 'auto'): TermApplication[] {
+  const rule: Record<string, { source: string; replacement: string }> = {
+    'term-1': { source: 'co pilot', replacement: 'Co-Pilot' },
+    'term-2': { source: 'studio cloud', replacement: 'Studio Cloud' },
+    'term-3': { source: '五G', replacement: '5G' },
+  };
+  return [{ ruleId, ruleVersion: 1, ...rule[ruleId], kind, at: now - 60_000 }];
+}
+
 const seededSegments: CaptionSegment[] = [
-  segment('seg-1', 1, 0, '主持人', '欢迎大家来到二零二六年产品发布会。', '欢迎大家来到2026年产品发布会。', 'confirmed'),
+  {
+    ...segment('seg-1', 1, 0, '主持人', '欢迎大家来到二零二六年产品发布会。', '欢迎大家来到2026年产品发布会。', 'confirmed'),
+    manualOverride: true,
+  },
   segment('seg-2', 2, 7, '主讲人', '今天我们会介绍三个模块,首先是实时协作。', '今天我们会介绍三个模块，首先是实时协作。', 'confirmed'),
   segment('seg-3', 3, 15, '主讲人', '延迟和质量监测会帮助我们保持字幕稳定。', '延迟和质量监测会帮助我们保持字幕稳定。', 'confirmed'),
-  segment('seg-4', 4, 24, '嘉宾 / 周然', '我们使用 studio cloud 作为演示环境。', '我们使用 Studio Cloud 作为演示环境。', 'pending'),
-  segment('seg-5', 5, 34, '嘉宾 / 周然', '每分钟大约会收到一百二十个片段。', '每分钟大约会收到120个片段。', 'pending'),
-  segment('seg-6', 6, 43, '主持人', '如果主持人提到 co pilot,需要统一大小写。', '如果主持人提到 Co-Pilot，需要统一大小写。', 'pending'),
-  segment('seg-7', 7, 52, '主持人', '这个例子会演示五G网络下的字幕恢复。', '这个例子会演示5G网络下的字幕恢复。', 'pending'),
+  {
+    ...segment('seg-4', 4, 24, '嘉宾 / 周然', '我们使用 studio cloud 作为演示环境。', '我们使用 Studio Cloud 作为演示环境。', 'pending'),
+    ruleApplications: applied('term-2', 'shortcut'),
+    tags: ['术语已应用'],
+  },
+  {
+    ...segment('seg-5', 5, 34, '嘉宾 / 周然', '每分钟大约会收到一百二十个片段。', '每分钟大约会收到120个片段。', 'pending'),
+    manualOverride: true,
+  },
+  {
+    // 直播区里被错误译法规则自动替换、且没有再被人工改动过的片段：修订时从原始字幕整体重放。
+    ...segment('seg-6', 6, 43, '主持人', '如果主持人提到 co pilot,需要统一大小写。', '如果主持人提到 Co-Pilot，需要统一大小写。', 'confirmed'),
+    ruleApplications: applied('term-1'),
+    tags: ['术语已应用'],
+  },
+  {
+    // 规则替换后校对员又手动改过：修订时保留人工修改，只定点替换错误译法。
+    ...segment('seg-7', 7, 52, '主持人', '这个例子会演示 co pilot 在五G网络下的字幕恢复。', '本例演示 Co-Pilot 在5G网络下的字幕恢复流程。', 'confirmed'),
+    ruleApplications: [...applied('term-1'), ...applied('term-3', 'shortcut')],
+    manualOverride: true,
+    tags: ['术语已应用'],
+  },
 ];
 
 const duplicate: CaptionSegment = {
@@ -105,9 +166,9 @@ export function createInitialModel(): DeskModel {
     eventDate: new Date(now).toISOString().slice(0, 10),
     segments: [...seededSegments, duplicate],
     rules: [
-      { id: 'term-1', source: 'co pilot', replacement: 'Co-Pilot', speaker: '', enabled: true, caseSensitive: false, usageCount: 4, createdAt: now - 86_400_000 },
-      { id: 'term-2', source: 'studio cloud', replacement: 'Studio Cloud', speaker: '', enabled: true, caseSensitive: false, usageCount: 7, createdAt: now - 43_200_000 },
-      { id: 'term-3', source: '五G', replacement: '5G', speaker: '', enabled: true, caseSensitive: true, usageCount: 2, createdAt: now - 3_600_000 },
+      { id: 'term-1', source: 'co pilot', replacement: 'Co-Pilot', speaker: '', enabled: true, caseSensitive: false, usageCount: 4, version: 1, createdAt: now - 86_400_000 },
+      { id: 'term-2', source: 'studio cloud', replacement: 'Studio Cloud', speaker: '', enabled: true, caseSensitive: false, usageCount: 7, version: 1, createdAt: now - 43_200_000 },
+      { id: 'term-3', source: '五G', replacement: '5G', speaker: '', enabled: true, caseSensitive: true, usageCount: 2, version: 1, createdAt: now - 3_600_000 },
     ],
     selectedId: 'seg-4',
     connection: 'connected',
@@ -180,6 +241,185 @@ export function applyRules(text: string, model: DeskModel): { text: string; used
   return { text: normalizePunctuation(next), used };
 }
 
+/** 直播区当前生效文本：直播原版叠加修订链，最后一条修订的结果为准。 */
+export function liveText(segment: CaptionSegment): string {
+  return segment.amendments.length ? segment.amendments[segment.amendments.length - 1].correctedText : segment.corrected;
+}
+
+export function latestAmendment(segment: CaptionSegment): CaptionAmendment | undefined {
+  return segment.amendments[segment.amendments.length - 1];
+}
+
+/** 旧版本草稿补字段，避免历史 localStorage 数据缺字段。 */
+export function migrateModel(model: DeskModel): DeskModel {
+  return {
+    ...model,
+    rules: model.rules.map((rule) => ({ ...rule, version: rule.version ?? 1 })),
+    segments: model.segments.map((segment) => ({
+      ...segment,
+      tags: segment.tags ?? [],
+      ruleApplications: segment.ruleApplications ?? [],
+      amendments: segment.amendments ?? [],
+      manualOverride: segment.manualOverride ?? false,
+    })),
+  };
+}
+
+function literalReplaceAll(text: string, oldValue: string, newValue: string): string {
+  if (!oldValue) return text;
+  return text.split(oldValue).join(newValue);
+}
+
+/** 从原始字幕出发整体重放当前术语规则（用于没有人工改动的纯规则片段）。 */
+function replayFromOriginal(segment: CaptionSegment, rules: TermRule[]): string {
+  let next = segment.original;
+  for (const rule of rules.filter((item) => item.enabled && (!item.speaker || item.speaker === segment.speaker))) {
+    if (!rule.source || !next) continue;
+    const flags = rule.caseSensitive ? 'g' : 'gi';
+    const expression = new RegExp(rule.source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
+    next = next.replace(expression, rule.replacement);
+  }
+  return normalizePunctuation(next);
+}
+
+interface PushAmendmentOptions {
+  reason: string;
+  atMerge?: boolean;
+  createdAt: number;
+}
+
+/**
+ * 为单个片段追加一条术语修订。
+ * 人工改过的片段：保留人工修改，只把旧译法定点替换为新译法；
+ * 纯规则片段：从原始字幕按当前规则整体重算。
+ * 无实际变化时不产生修订。
+ */
+function pushRuleAmendment(
+  segment: CaptionSegment,
+  rule: TermRule,
+  oldReplacement: string,
+  currentRules: TermRule[],
+  options: PushAmendmentOptions,
+): CaptionAmendment | undefined {
+  const previousText = liveText(segment);
+  const candidate = segment.manualOverride
+    ? literalReplaceAll(previousText, oldReplacement, rule.replacement)
+    : replayFromOriginal(segment, currentRules);
+  if (candidate === previousText) return undefined;
+
+  const supersedes = latestAmendment(segment);
+  const amendment: CaptionAmendment = {
+    id: `amd-${segment.id}-${rule.id}-${options.createdAt.toString(36)}-${segment.amendments.length + 1}`,
+    ordinal: segment.amendments.length + 1,
+    ruleId: rule.id,
+    reason: options.reason,
+    supersedesAmendmentId: supersedes?.id,
+    supersedesLabel: supersedes ? `第 ${supersedes.ordinal} 版修订` : '直播原版',
+    previousText,
+    correctedText: candidate,
+    oldReplacement,
+    newReplacement: rule.replacement,
+    atMerge: options.atMerge ?? false,
+    createdAt: options.createdAt,
+  };
+  segment.amendments.push(amendment);
+  segment.ruleApplications = segment.ruleApplications.map((item) => (
+    item.ruleId === rule.id ? { ...item, replacement: rule.replacement, ruleVersion: rule.version } : item
+  ));
+  segment.tags = [...new Set([...segment.tags, '术语已修订'])];
+  return amendment;
+}
+
+export interface RuleRevisionResult {
+  model: DeskModel;
+  amendedIds: string[];
+  refreshedPendingIds: string[];
+}
+
+/**
+ * 修订一条术语规则的译法：
+ * - 规则版本号 +1；
+ * - 已确认（含离线发件箱）片段追加修订版，保留人工修改，不直接覆盖直播原版；
+ * - 待确认片段直接刷新为新译法（尚未进入直播历史，无需留修订版）。
+ */
+export function reviseRuleReplacement(model: DeskModel, ruleId: string, newReplacement: string, createdAt = Date.now()): RuleRevisionResult | undefined {
+  const rule = model.rules.find((item) => item.id === ruleId);
+  if (!rule) return undefined;
+  const trimmed = newReplacement.trim();
+  if (!trimmed || trimmed === rule.replacement) return undefined;
+  const oldReplacement = rule.replacement;
+
+  const updatedRule: TermRule = { ...rule, replacement: trimmed, version: rule.version + 1 };
+  const updatedRules = model.rules.map((item) => (item.id === ruleId ? updatedRule : item));
+
+  const amendedIds: string[] = [];
+  const refreshedPendingIds: string[] = [];
+  const segments = model.segments.map((item) => {
+    if (!item.ruleApplications.some((application) => application.ruleId === ruleId)) return item;
+    const clone = { ...item, ruleApplications: [...item.ruleApplications], amendments: [...item.amendments], tags: [...item.tags] };
+    if (item.state === 'confirmed') {
+      const amendment = pushRuleAmendment(clone, updatedRule, oldReplacement, updatedRules, {
+        reason: `规则「${rule.source}」译法修订`,
+        createdAt,
+      });
+      if (amendment) amendedIds.push(item.id);
+    } else {
+      const refreshed = literalReplaceAll(clone.corrected, oldReplacement, trimmed);
+      if (refreshed !== clone.corrected) {
+        clone.corrected = refreshed;
+        clone.ruleApplications = clone.ruleApplications.map((application) => (
+          application.ruleId === ruleId ? { ...application, replacement: trimmed, ruleVersion: updatedRule.version } : application
+        ));
+        clone.tags = [...new Set([...clone.tags, '术语已修订'])];
+        refreshedPendingIds.push(item.id);
+      }
+    }
+    return clone;
+  });
+
+  return {
+    model: { ...model, rules: updatedRules, segments },
+    amendedIds,
+    refreshedPendingIds,
+  };
+}
+
+/** 找出已确认片段中规则应用版本落后于当前规则版本的记录（离线期间改了规则时使用）。 */
+export function staleRuleApplications(segment: CaptionSegment, rules: TermRule[]): TermApplication[] {
+  return segment.ruleApplications.filter((application) => {
+    const rule = rules.find((item) => item.id === application.ruleId);
+    return !!rule && rule.enabled && rule.version > application.ruleVersion && rule.replacement !== application.replacement;
+  });
+}
+
+export interface MergeRecomputeResult {
+  model: DeskModel;
+  amendedIds: string[];
+}
+
+/** 恢复连接合并时，对离线确认的片段一并重算过期的术语规则应用。 */
+export function recomputeAtMerge(model: DeskModel, createdAt = Date.now()): MergeRecomputeResult {
+  const amendedIds: string[] = [];
+  const segments = model.segments.map((item) => {
+    if (item.source !== 'offline' || item.state !== 'confirmed') return item;
+    const stale = staleRuleApplications(item, model.rules);
+    if (!stale.length) return item;
+    const clone = { ...item, ruleApplications: [...item.ruleApplications], amendments: [...item.amendments], tags: [...item.tags] };
+    for (const application of stale) {
+      const rule = model.rules.find((candidate) => candidate.id === application.ruleId);
+      if (!rule) continue;
+      const amendment = pushRuleAmendment(clone, rule, application.replacement, model.rules, {
+        reason: `离线确认片段恢复连接，按规则 v${rule.version} 重算`,
+        atMerge: true,
+        createdAt,
+      });
+      if (amendment) amendedIds.push(item.id);
+    }
+    return clone;
+  });
+  return { model: { ...model, segments }, amendedIds };
+}
+
 export function isDuplicate(candidate: CaptionSegment, existing: CaptionSegment[]): CaptionSegment | undefined {
   const normalize = (value: string) => value.replace(/[\s，。！？；：,.;:!?]/g, '').toLocaleLowerCase();
   const candidateText = normalize(candidate.corrected || candidate.original);
@@ -192,9 +432,11 @@ export function isDuplicate(candidate: CaptionSegment, existing: CaptionSegment[
 }
 
 export function mergeConfirmedSegments(model: DeskModel): DeskModel {
+  // 恢复连接先重算离线确认片段上过期的术语规则应用，再做排序、重复与过期检查。
+  const recomputed = recomputeAtMerge(model).model;
   const seen: string[] = [];
-  const segments = model.segments
-    .map((item) => ({ ...item }))
+  const segments = recomputed.segments
+    .map((item) => ({ ...item, amendments: [...item.amendments], ruleApplications: [...item.ruleApplications], tags: [...item.tags] }))
     .sort((a, b) => a.sequence - b.sequence || a.startTime - b.startTime)
     .map((item): CaptionSegment => {
       if (item.source === 'offline' && item.state === 'confirmed') {
@@ -260,6 +502,9 @@ export function createLiveSegment(sequence: number): CaptionSegment {
     state: 'pending',
     revision: 0,
     tags: [],
+    ruleApplications: [],
+    amendments: [],
+    manualOverride: false,
   };
 }
 
@@ -301,6 +546,6 @@ export function toSrt(model: DeskModel): string {
   return model.segments
     .filter((item) => item.state === 'confirmed')
     .sort((a, b) => a.startTime - b.startTime)
-    .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.startTime + 7)}\n[${item.speaker}] ${item.corrected}\n`)
+    .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.startTime + 7)}\n[${item.speaker}] ${liveText(item)}\n`)
     .join('\n');
 }
